@@ -32,18 +32,7 @@ namespace EventStoreClient.Connection
             _packageLength = 0;
             _bufferIndex = 0;
         }
-
-        public void UnFrameData(IEnumerable<ArraySegment<byte>> data)
-        {
-            if (data == null)
-                throw new ArgumentNullException("data");
-
-            foreach (ArraySegment<byte> buffer in data)
-            {
-                Parse(buffer);
-            }
-        }
-
+        
         public void UnFrameData(ArraySegment<byte> data)
         {
             Parse(data);
@@ -87,13 +76,16 @@ namespace EventStoreClient.Connection
             }
         }
 
-        public IEnumerable<ArraySegment<byte>> FrameData(ArraySegment<byte> data)
+        public ArraySegment<byte> FrameData(ArraySegment<byte> data)
         {
             var length = data.Count;
-
-            yield return new ArraySegment<byte>(
-                new[] { (byte)length, (byte)(length >> 8), (byte)(length >> 16), (byte)(length >> 24) });
-            yield return data;
+            var array = new byte[length+4];
+            array[0] = (byte)length;
+            array[1] = (byte)(length >> 8);
+            array[2] = (byte)(length >> 16);
+            array[3] = (byte)(length >> 24);
+            Buffer.BlockCopy(data.Array, 0, array, 4, length);
+            return new ArraySegment<byte>(array, 0, length + 4);
         }
         
         public void RegisterMessageArrivedCallback(Action<ArraySegment<byte>> handler)

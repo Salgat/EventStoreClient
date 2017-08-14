@@ -90,7 +90,7 @@ namespace EventStoreClient.Connection
                 // Received data
                 var size = _pendingReceive.Result;
                 var data = new ArraySegment<byte>(_receiveBuffer.Array, 0, size);
-                _framer.UnFrameData(new List<ArraySegment<byte>>() { data });
+                _framer.UnFrameData(data);
                 
                 // Send next receive request
                 _pendingReceive = connection.ReceiveAsync(_receiveBuffer, SocketFlags.None);
@@ -113,8 +113,6 @@ namespace EventStoreClient.Connection
         private void IncomingMessageArrived(ArraySegment<byte> data)
         {
             var package = TcpPackage.FromArraySegment(data);
-
-            Debug.WriteLine($"Received package {package.Command}");
             _pendingMessages.Enqueue(package);
         }
 
@@ -141,19 +139,8 @@ namespace EventStoreClient.Connection
         private async Task SendMessage(TcpPackage package)
         {
             var data = package.AsArraySegment();
-            var framed = _framer.FrameData(data).ToList();
-
-            var packageSize = framed.Sum(segment => segment.Count);
-            int offset = 0;
-            byte[] dataToSend = new byte[packageSize];
-            foreach (var segment in framed)
-            {
-                Buffer.BlockCopy(segment.Array, 0, dataToSend, offset, segment.Count);
-                offset += segment.Count;
-            }
-
-            Debug.WriteLine($"Sending package {package.Command}");
-            await connection.SendAsync(new ArraySegment<byte>(dataToSend, 0, count: packageSize), SocketFlags.None).ConfigureAwait(false);
+            var framed = _framer.FrameData(data);
+            await connection.SendAsync(framed, SocketFlags.None).ConfigureAwait(false);
         }
     }
 }
