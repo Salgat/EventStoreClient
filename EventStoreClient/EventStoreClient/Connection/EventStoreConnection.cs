@@ -20,7 +20,7 @@ namespace EventStoreClient.Connection
 
         public async Task CloseAsync()
         {
-            await connectionManager.CloseConnection().ConfigureAwait(false);
+            await connectionManager.CloseConnectionAsync().ConfigureAwait(false);
         }
 
         public async Task ConnectAsync()

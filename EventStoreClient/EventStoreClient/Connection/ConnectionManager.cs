@@ -34,7 +34,6 @@ namespace EventStoreClient.Connection
         LengthPrefixMessageFramer _framer;
         ConcurrentQueue<TcpPackage> _pendingMessages = new ConcurrentQueue<TcpPackage>();
         ConcurrentQueue<TcpPackage> _pendingSendMessages = new ConcurrentQueue<TcpPackage>();
-        private Task<int> _pendingReceive = null;
         private readonly ArraySegment<byte> _receiveBuffer = new ArraySegment<byte>(new byte[TcpConfiguration.SocketBufferSize]);
 
         public ConnectionManager(ConnectionSettings settings)
@@ -56,8 +55,9 @@ namespace EventStoreClient.Connection
             connected = true;
 
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
-            Task.Run(async () => 
+            Task.Run(async () =>
             {
+                Listen();
                 while (connected)
                 {
                     await ManageConnection().ConfigureAwait(false);
@@ -67,7 +67,7 @@ namespace EventStoreClient.Connection
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
         }
 
-        public async Task CloseConnection()
+        public async Task CloseConnectionAsync()
         {
             connected = false;
             connection.Shutdown(SocketShutdown.Both);
@@ -80,24 +80,30 @@ namespace EventStoreClient.Connection
         /// <returns></returns>
         private async Task ManageConnection()
         {
-            if (_pendingReceive == null)
-            {
-                // Send initial receive request
-                _pendingReceive = connection.ReceiveAsync(_receiveBuffer, SocketFlags.None);
-            }
-            else if (_pendingReceive.IsCompleted == true)
-            {
-                // Received data
-                var size = _pendingReceive.Result;
-                var data = new ArraySegment<byte>(_receiveBuffer.Array, 0, size);
-                _framer.UnFrameData(data);
-                
-                // Send next receive request
-                _pendingReceive = connection.ReceiveAsync(_receiveBuffer, SocketFlags.None);
-            }
-            
             await HandleIncomingMessages().ConfigureAwait(false);
             await HandlePendingSendMessages().ConfigureAwait(false);
+        }
+
+        private async Task Listen()
+        {
+            while (connected)
+            {
+                int size = 0;
+                try
+                {
+                    size = await connection.ReceiveAsync(_receiveBuffer, SocketFlags.None).ConfigureAwait(false);
+                }
+                catch (SocketException ex)
+                {
+                    if (ex.SocketErrorCode == SocketError.NotConnected)
+                    {
+                        connected = false;
+                    }
+                    return;
+                }
+                var data = new ArraySegment<byte>(_receiveBuffer.Array, 0, size);
+                _framer.UnFrameData(data);
+            }
         }
 
         private async Task HandlePendingSendMessages()
