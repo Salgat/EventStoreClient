@@ -20,9 +20,10 @@ namespace EventStoreClient.Connection
         /// <summary>
         /// Initializes a new instance of the <see cref="LengthPrefixMessageFramer"/> class.
         /// </summary>
-        public LengthPrefixMessageFramer(int maxPackageSize = 64 * 1024 * 1024)
+        public LengthPrefixMessageFramer(Action<ArraySegment<byte>> handler = null, int maxPackageSize = 64 * 1024 * 1024)
         {
             _maxPackageSize = maxPackageSize;
+            _receivedHandler = handler;
         }
 
         public void Reset()
@@ -76,7 +77,7 @@ namespace EventStoreClient.Connection
             }
         }
 
-        public ArraySegment<byte> FrameData(ArraySegment<byte> data)
+        public static ArraySegment<byte> FrameData(ArraySegment<byte> data)
         {
             var length = data.Count;
             var array = new byte[length+4];
@@ -86,14 +87,6 @@ namespace EventStoreClient.Connection
             array[3] = (byte)(length >> 24);
             Buffer.BlockCopy(data.Array, 0, array, 4, length);
             return new ArraySegment<byte>(array, 0, length + 4);
-        }
-        
-        public void RegisterMessageArrivedCallback(Action<ArraySegment<byte>> handler)
-        {
-            if (handler == null)
-                throw new ArgumentNullException("handler");
-
-            _receivedHandler = handler;
         }
     }
 }

@@ -10,6 +10,8 @@ namespace EventStoreClient
         string ConnectionName { get; }
         Task ConnectAsync();
         Task CloseAsync();
+
+        Task WriteEvents(IEnumerable<Event> events, string stream, long expectedEventNumber);
         
         ConnectionSettings Settings { get; }
     }

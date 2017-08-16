@@ -8,6 +8,9 @@ using Google.Protobuf;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Diagnostics;
+using EventStore.Client.Messages;
+using Google.Protobuf.Collections;
+using System.IO;
 
 namespace EventStoreClient.Connection
 {
@@ -31,18 +34,16 @@ namespace EventStoreClient.Connection
         private readonly ConnectionSettings _settings;
         private bool connected = false;
         private Socket connection = null;
-        LengthPrefixMessageFramer _framer;
+        //LengthPrefixMessageFramer _framer;
         ConcurrentQueue<TcpPackage> _pendingMessages = new ConcurrentQueue<TcpPackage>();
         ConcurrentQueue<TcpPackage> _pendingSendMessages = new ConcurrentQueue<TcpPackage>();
         private readonly ArraySegment<byte> _receiveBuffer = new ArraySegment<byte>(new byte[TcpConfiguration.SocketBufferSize]);
 
+        private ConcurrentDictionary<Guid, TaskCompletionSource<object>> _pendingWrites = new ConcurrentDictionary<Guid, TaskCompletionSource<object>>();
+
         public ConnectionManager(ConnectionSettings settings)
         {
             _settings = settings;
-            _framer = new LengthPrefixMessageFramer();
-            _framer.RegisterMessageArrivedCallback(IncomingMessageArrived);
-            
-            // Initialize for first time
         }
 
         public async Task StartConnection()
@@ -86,6 +87,7 @@ namespace EventStoreClient.Connection
 
         private async Task Listen()
         {
+            var framer = new LengthPrefixMessageFramer(IncomingMessageArrived);
             while (connected)
             {
                 int size = 0;
@@ -102,7 +104,7 @@ namespace EventStoreClient.Connection
                     return;
                 }
                 var data = new ArraySegment<byte>(_receiveBuffer.Array, 0, size);
-                _framer.UnFrameData(data);
+                framer.UnFrameData(data);
             }
         }
 
@@ -122,6 +124,13 @@ namespace EventStoreClient.Connection
             _pendingMessages.Enqueue(package);
         }
 
+        private async Task SendMessage(TcpPackage package)
+        {
+            var data = package.AsArraySegment();
+            var framed = LengthPrefixMessageFramer.FrameData(data);
+            await connection.SendAsync(framed, SocketFlags.None).ConfigureAwait(false);
+        }
+
         private async Task HandleIncomingMessages()
         {
             while (_pendingMessages.TryDequeue(out TcpPackage package))
@@ -139,14 +148,88 @@ namespace EventStoreClient.Connection
                     _pendingSendMessages.Enqueue(heartbeatMessage);
                     return;
                 }
+
+                // Write events completed
+                if (package.Command == TcpCommand.WriteEventsCompleted)
+                {
+                    if (_pendingWrites.TryGetValue(package.CorrelationId, out TaskCompletionSource<object> pendingWrite))
+                    {
+                        if (pendingWrite != null)
+                        {
+                            var response = WriteEventsCompleted.Parser.ParseFrom(package.Data.ToArray<byte>());
+
+                            switch (response.Result)
+                            {
+                                // TODO: Implement proper exception classes
+                                case OperationResult.Success:
+                                    pendingWrite.SetResult(new object());
+                                    break;
+                                case OperationResult.CommitTimeout:
+                                    pendingWrite.SetException(new Exception("CommitTimeout exception"));
+                                    break;
+                                case OperationResult.WrongExpectedVersion:
+                                    pendingWrite.SetException(new Exception("WrongExpectedVersion exception"));
+                                    break;
+                                default:
+                                    pendingWrite.SetException(new Exception($"Unexpected exception: {response.Message}"));
+                                    break;
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        private async Task SendMessage(TcpPackage package)
+        /// <summary>
+        /// Write events to specific stream.
+        /// </summary>
+        /// <param name="events"></param>
+        /// <param name="stream"></param>
+        /// <param name="expectedVersion"></param>
+        /// <returns></returns>
+        public async Task WriteEvents(IEnumerable<Event> events, string stream, long expectedVersion)
         {
-            var data = package.AsArraySegment();
-            var framed = _framer.FrameData(data);
-            await connection.SendAsync(framed, SocketFlags.None).ConfigureAwait(false);
+            var writeCorrelationId = Guid.NewGuid();
+            var pendingWriteTask = new TaskCompletionSource<object>();
+            if (_pendingWrites.TryAdd(writeCorrelationId, pendingWriteTask))
+            {
+                // Populate protobuf objects for events
+                var eventsToWrite = events.Select(e => new NewEvent() {
+                    EventId = ByteString.CopyFrom(e.Id.ToByteArray()),
+                    EventType = e.EventType,
+                    Data = ByteString.CopyFrom(e.Data.Array),
+                    DataContentType = e.IsJson ? 1 : 0,
+                    Metadata = ByteString.CopyFrom(e.MetaData.Array),
+                    MetadataContentType = 0
+                    });
+                
+                var writeEventsMessage = new WriteEvents()
+                {
+                    EventStreamId = stream,
+                    ExpectedVersion = expectedVersion,
+                    RequireMaster = true
+                };
+                writeEventsMessage.Events.AddRange(eventsToWrite);
+
+                // Serialize events
+                ArraySegment<byte> eventsSerialized;
+                using (var memory = new MemoryStream())
+                {
+                    writeEventsMessage.WriteTo(memory);
+                    eventsSerialized = new ArraySegment<byte>(memory.GetBuffer(), 0, (int)memory.Length);
+                }
+
+                // Send write package
+                var package = new TcpPackage(TcpCommand.WriteEvents, writeCorrelationId, eventsSerialized.ToArray<byte>());
+                _pendingSendMessages.Enqueue(package);
+
+                // Wait for write to be acknowledged by server then remove completed task
+                await pendingWriteTask.Task.ConfigureAwait(false);
+                _pendingWrites.TryRemove(writeCorrelationId, out var discard);
+
+                return;
+            }
+            throw new Exception("CorrelationId already in use?");
         }
     }
 }

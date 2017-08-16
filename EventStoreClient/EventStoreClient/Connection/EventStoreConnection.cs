@@ -28,5 +28,10 @@ namespace EventStoreClient.Connection
             connectionManager = new ConnectionManager(Settings);
             await connectionManager.StartConnection().ConfigureAwait(false);
         }
+
+        public async Task WriteEvents(IEnumerable<Event> events, string stream, long expectedEventNumber)
+        {
+            await connectionManager.WriteEvents(events, stream, expectedEventNumber).ConfigureAwait(false);
+        }
     }
 }
