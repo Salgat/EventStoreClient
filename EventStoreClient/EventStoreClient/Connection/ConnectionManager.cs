@@ -231,7 +231,7 @@ namespace EventStoreClient.Connection
         private async Task<IEnumerable<RecordedEvent>> ReadEventsBatch(string stream, long fromNumber, int count, bool resolveLinkTos)
         {
             var readCorrelationId = Guid.NewGuid();
-            var pendingReadTask = new TaskCompletionSource<ReadStreamEventsCompleted>();
+            var pendingReadTask = new TaskCompletionSource<ReadStreamEventsCompleted>(TaskCreationOptions.RunContinuationsAsynchronously);
             if (_pendingReads.TryAdd(readCorrelationId, pendingReadTask))
             {
                 var readMessage = new ReadStreamEvents()
@@ -286,7 +286,7 @@ namespace EventStoreClient.Connection
         public async Task WriteEvents(IEnumerable<CreateEvent> events, string stream, long expectedVersion)
         {
             var writeCorrelationId = Guid.NewGuid();
-            var pendingWriteTask = new TaskCompletionSource<object>();
+            var pendingWriteTask = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
             if (_pendingWrites.TryAdd(writeCorrelationId, pendingWriteTask))
             {
                 // Populate protobuf objects for events
