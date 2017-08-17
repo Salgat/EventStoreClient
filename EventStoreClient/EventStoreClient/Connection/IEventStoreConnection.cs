@@ -11,8 +11,10 @@ namespace EventStoreClient
         Task ConnectAsync();
         Task CloseAsync();
 
-        Task WriteEvents(IEnumerable<Event> events, string stream, long expectedEventNumber);
-        
+        Task WriteEvents(IEnumerable<CreateEvent> events, string stream, long expectedEventNumber);
+        Task<IEnumerable<RecordedEvent>> ReadEvents(string stream, long fromNumber, int count, bool resolveLinkTos);
+
+
         ConnectionSettings Settings { get; }
     }
 }

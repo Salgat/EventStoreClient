@@ -11,6 +11,7 @@ using System.Diagnostics;
 using EventStore.Client.Messages;
 using Google.Protobuf.Collections;
 using System.IO;
+using static EventStore.Client.Messages.ReadStreamEventsCompleted.Types;
 
 namespace EventStoreClient.Connection
 {
@@ -34,12 +35,12 @@ namespace EventStoreClient.Connection
         private readonly ConnectionSettings _settings;
         private bool connected = false;
         private Socket connection = null;
-        //LengthPrefixMessageFramer _framer;
         ConcurrentQueue<TcpPackage> _pendingMessages = new ConcurrentQueue<TcpPackage>();
         ConcurrentQueue<TcpPackage> _pendingSendMessages = new ConcurrentQueue<TcpPackage>();
         private readonly ArraySegment<byte> _receiveBuffer = new ArraySegment<byte>(new byte[TcpConfiguration.SocketBufferSize]);
 
         private ConcurrentDictionary<Guid, TaskCompletionSource<object>> _pendingWrites = new ConcurrentDictionary<Guid, TaskCompletionSource<object>>();
+        private ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>> _pendingReads = new ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>>();
 
         public ConnectionManager(ConnectionSettings settings)
         {
@@ -176,8 +177,103 @@ namespace EventStoreClient.Connection
                             }
                         }
                     }
+                    return;
+                }
+
+                // Read events completed
+                if (package.Command == TcpCommand.ReadStreamEventsForwardCompleted)
+                {
+                    if (_pendingReads.TryGetValue(package.CorrelationId, out TaskCompletionSource<ReadStreamEventsCompleted> pendingRead))
+                    {
+                        if (pendingRead != null)
+                        {
+                            var response = ReadStreamEventsCompleted.Parser.ParseFrom(package.Data.ToArray<byte>());
+
+                            switch (response.Result)
+                            {
+                                case ReadStreamResult.Success:
+                                case ReadStreamResult.NoStream:
+                                    pendingRead.SetResult(response);
+                                    break;
+                                default:
+                                    pendingRead.SetException(new Exception($"Unexpected exception"));
+                                    break;
+                            }
+                        }
+                    }
+                    return;
                 }
             }
+        }
+
+        public async Task<IEnumerable<RecordedEvent>> ReadEvents(string stream, long fromNumber, int count, bool resolveLinkTos)
+        {
+            const int batchSize = 512;
+            var result = new List<RecordedEvent>();
+            int currentFromNumber = 0;
+            long lastEventNumber = fromNumber + count - 1;
+            while (currentFromNumber < lastEventNumber)
+            {
+                // TODO: Update batch size to be configurable
+                var batchResult = await ReadEventsBatch(stream, currentFromNumber, batchSize, resolveLinkTos).ConfigureAwait(false);
+                result.AddRange(batchResult);
+
+                // If this read resulted in no events, we are done reading
+                if (batchResult.Count() == 0) break;
+
+                // Continue to next batch of events
+                currentFromNumber += batchSize;
+            }
+
+            return result;
+        }
+
+        private async Task<IEnumerable<RecordedEvent>> ReadEventsBatch(string stream, long fromNumber, int count, bool resolveLinkTos)
+        {
+            var readCorrelationId = Guid.NewGuid();
+            var pendingReadTask = new TaskCompletionSource<ReadStreamEventsCompleted>();
+            if (_pendingReads.TryAdd(readCorrelationId, pendingReadTask))
+            {
+                var readMessage = new ReadStreamEvents()
+                {
+                    EventStreamId = stream,
+                    FromEventNumber = fromNumber,
+                    MaxCount = count,
+                    ResolveLinkTos = resolveLinkTos,
+                    RequireMaster = false
+                };
+
+                ArraySegment<byte> requestSerialized;
+                using (var memory = new MemoryStream())
+                {
+                    readMessage.WriteTo(memory);
+                    requestSerialized = new ArraySegment<byte>(memory.GetBuffer(), 0, (int)memory.Length);
+                }
+
+                var package = new TcpPackage(TcpCommand.ReadStreamEventsForward, readCorrelationId, requestSerialized.ToArray<byte>());
+                _pendingSendMessages.Enqueue(package);
+
+                // Wait for read to complete
+                var result = await pendingReadTask.Task.ConfigureAwait(false);
+                _pendingReads.TryRemove(readCorrelationId, out var discard);
+
+                // Return result
+                return result.Events.Select(e => 
+                {
+                    return new RecordedEvent()
+                    {
+                        Stream = e.Event.EventStreamId,
+                        Id = new Guid(e.Event.EventId.ToByteArray()),
+                        Created = new DateTime(e.Event.Created),
+                        Data = new ArraySegment<byte>(e.Event.Data.ToByteArray()),
+                        MetaData = new ArraySegment<byte>(e.Event.Metadata.ToByteArray()),
+                        EventNumber = e.Event.EventNumber,
+                        EventType = e.Event.EventType,
+                        IsJson = e.Event.DataContentType == 1
+                    };
+                });
+            }
+            throw new Exception("CorrelationId already in use?");
         }
 
         /// <summary>
@@ -187,7 +283,7 @@ namespace EventStoreClient.Connection
         /// <param name="stream"></param>
         /// <param name="expectedVersion"></param>
         /// <returns></returns>
-        public async Task WriteEvents(IEnumerable<Event> events, string stream, long expectedVersion)
+        public async Task WriteEvents(IEnumerable<CreateEvent> events, string stream, long expectedVersion)
         {
             var writeCorrelationId = Guid.NewGuid();
             var pendingWriteTask = new TaskCompletionSource<object>();
