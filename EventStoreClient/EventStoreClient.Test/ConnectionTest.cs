@@ -1,9 +1,11 @@
 using EventStoreClient.Connection;
+using EventStoreClient.Misc;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace EventStoreClient.Test
@@ -218,6 +220,68 @@ namespace EventStoreClient.Test
             Assert.AreEqual(events[0].Data.ToString(), readEventsList[0].Data.ToString());
             Assert.AreEqual(events[0].MetaData.ToString(), readEventsList[0].MetaData.ToString());
         }
+        #endregion
+
+        #region Catchup Subscription
+        [TestMethod]
+        public async Task CatchupSubscription_ReceivesEvents_Success()
+        {
+            var streamId = $"TestStream-{Guid.NewGuid():N}";
+            var credentials = new UserCredentials("admin", "changeit");
+            var connectionSettings = new ConnectionSettings(credentials, "127.0.0.1", 1113, "myConnection");
+            var connection = new EventStoreConnection(connectionSettings);
+            await connection.ConnectAsync().ConfigureAwait(false);
+
+            // First write a few events before the subscription
+            const int initialEventCounter = 3;
+            for (var i = 0; i < initialEventCounter; ++i)
+            {
+                await WriteRandomEventToStream(streamId, connection).ConfigureAwait(false);
+            }
+            
+            // Start catchup subscription
+            var totalEventsHandled = 0;
+            var subscription = await connection.CreateCatchupSubscription(streamId, 0, async e =>
+            {
+                Interlocked.Increment(ref totalEventsHandled);
+            }).ConfigureAwait(false);
+
+
+            const int afterEventCounter = 4;
+            for (var i = 0; i < afterEventCounter; ++i)
+            {
+                await WriteRandomEventToStream(streamId, connection).ConfigureAwait(false);
+            }
+
+            const int attempts = 5;
+            for (var i = 0; i < attempts; ++i)
+            {
+                if (Thread.VolatileRead(ref totalEventsHandled) == initialEventCounter + afterEventCounter)
+                {
+                    return;
+                }
+                await Task.Delay(500).ConfigureAwait(false);
+            }
+            throw new Exception($"Only {Thread.VolatileRead(ref totalEventsHandled)} events handled of expected {initialEventCounter + afterEventCounter}");
+        }
+
+
+        private async Task WriteRandomEventToStream(string stream, IEventStoreConnection connection)
+        {
+            var events = new List<CreateEvent>()
+            {
+                new CreateEvent()
+                {
+                    Id = Guid.NewGuid(),
+                    EventType = "TestType",
+                    IsJson = true,
+                    Data = Encoding.UTF8.GetBytes("{\"Key\": \"Value\"}"),
+                    MetaData = Encoding.UTF8.GetBytes("{}")
+                }
+            };
+            await connection.WriteEvents(events, stream, ExpectedEventNumber.Any).ConfigureAwait(false);
+        }
+
         #endregion
     }
 }

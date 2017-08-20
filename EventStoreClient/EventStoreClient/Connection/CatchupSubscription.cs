@@ -4,42 +4,58 @@ using System.Collections.Generic;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using EventStore.Client.Messages;
 
 namespace EventStoreClient
 {
-    internal class CatchupSubscription
+    public class CatchupSubscription
     {
-        private readonly Func<RecordedEvent, Task> _callback;
-        private readonly ConcurrentQueue<IList<RecordedEvent>> _pendingEvents = new ConcurrentQueue<IList<RecordedEvent>>();
+        private readonly Guid _correlationId;
+        private readonly Func<ResolvedEvent, Task> _callback;
+        private readonly ConcurrentQueue<ResolvedEvent> _pendingEvents = new ConcurrentQueue<ResolvedEvent>();
         private int _alive = 0; // 0 = alive, 1 = closed
         private readonly Func<Task> _closeSubscription;
+        internal readonly TaskCompletionSource<object> SubscriptionStarted = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public CatchupSubscription(Func<RecordedEvent, Task> eventHandler, Func<Task> closeSubscriptionCallback)
+        internal CatchupSubscription(Func<ResolvedEvent, Task> eventHandler, Func<Task> closeSubscriptionCallback, Guid correlationId)
         {
             _callback = eventHandler;
             _closeSubscription = closeSubscriptionCallback;
+            _correlationId = correlationId;
         }
-        
-        public async Task HandlePendingEvents()
+
+        internal void AddEvent(ResolvedEvent e)
         {
-            if (_pendingEvents.TryDequeue(out var events))
+            _pendingEvents.Enqueue(e);
+        }
+
+        internal async Task HandlePendingEvents()
+        {
+            while (_pendingEvents.TryDequeue(out var e))
             {
-                foreach (var e in events)
+                if (Thread.VolatileRead(ref _alive) >= 1) return;
+                try
                 {
-                    if (Thread.VolatileRead(ref _alive) >= 1) return;
-                    try
-                    {
-                        await _callback(e).ConfigureAwait(false);
-                    }
-                    catch (Exception)
-                    {
-                        // Event handling failed, close subscription and rethrow exception.
-                        Interlocked.Increment(ref _alive);
-                        await _closeSubscription().ConfigureAwait(false);
-                        throw;
-                    }
+                    await _callback(e).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // Event handling failed, close subscription and rethrow exception.
+                    Interlocked.Increment(ref _alive);
+                    await _closeSubscription().ConfigureAwait(false);
+                    throw;
                 }
             }
+        }
+
+        /// <summary>
+        /// Closes the catchup subscription, ending handling of new events.
+        /// </summary>
+        /// <returns></returns>
+        public async Task CloseSubscriptionAsync()
+        {
+            Interlocked.Increment(ref _alive);
+            await _closeSubscription().ConfigureAwait(false);
         }
     }
 }

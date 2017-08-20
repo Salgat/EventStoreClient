@@ -1,13 +1,16 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
+using EventStore.Client.Messages;
 
 namespace EventStoreClient.Connection
 {
     public class EventStoreConnection : IEventStoreConnection
     {
         public string ConnectionName => Settings.ConnectionName;
+        private int started = 0; // 0 == false, 1 == true
 
         public ConnectionSettings Settings { get; }
 
@@ -30,16 +33,25 @@ namespace EventStoreClient.Connection
         {
             _connectionManager = new ConnectionManager(Settings);
             await _connectionManager.StartConnection().ConfigureAwait(false);
+            Interlocked.Increment(ref started);
         }
 
         public async Task WriteEvents(IEnumerable<CreateEvent> events, string stream, long expectedEventNumber)
         {
+            if (started == 0) throw new Exception("Connection not started yet.");
             await _connectionManager.WriteEvents(events, stream, expectedEventNumber).ConfigureAwait(false);
         }
 
         public Task<IEnumerable<RecordedEvent>> ReadEvents(string stream, long fromNumber, int count, bool resolveLinkTos)
         {
+            if (started == 0) throw new Exception("Connection not started yet.");
             return _connectionManager.ReadEvents(stream, fromNumber, count, resolveLinkTos);
+        }
+
+        public Task<CatchupSubscription> CreateCatchupSubscription(string stream, long fromNumber, Func<ResolvedEvent, Task> eventAppearedCallback)
+        {
+            if (started == 0) throw new Exception("Connection not started yet.");
+            return _connectionManager.CreateCatchupSubscription(stream, fromNumber, eventAppearedCallback, Settings.CatchupSubscriptionTimeout);
         }
     }
 }

@@ -41,6 +41,7 @@ namespace EventStoreClient.Connection
 
         private readonly ConcurrentDictionary<Guid, TaskCompletionSource<object>> _pendingWrites = new ConcurrentDictionary<Guid, TaskCompletionSource<object>>();
         private readonly ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>> _pendingReads = new ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>>();
+        private readonly ConcurrentDictionary<Guid, CatchupSubscription> _catchupSubscriptions = new ConcurrentDictionary<Guid, CatchupSubscription>();
 
         public ConnectionManager(ConnectionSettings settings)
         {
@@ -82,8 +83,18 @@ namespace EventStoreClient.Connection
         /// <returns></returns>
         private async Task ManageConnection()
         {
-            HandleIncomingMessages();
-            await HandlePendingSendMessages().ConfigureAwait(false);
+            var incomingMessagesTask = HandleIncomingMessagesAsync();
+            var handlePendingSendMessagesTask = HandlePendingSendMessages();
+            var handlePendingCatchupEventsTask = _catchupSubscriptions.Select(subscription => subscription.Value.HandlePendingEvents());
+
+            var pendingTasks = new List<Task>()
+            {
+                incomingMessagesTask,
+                handlePendingSendMessagesTask
+            };
+            pendingTasks.AddRange(handlePendingCatchupEventsTask);
+
+            await Task.WhenAll(pendingTasks).ConfigureAwait(false);
         }
 
         private async Task Listen()
@@ -132,7 +143,7 @@ namespace EventStoreClient.Connection
             await _connection.SendAsync(framed, SocketFlags.None).ConfigureAwait(false);
         }
 
-        private void HandleIncomingMessages()
+        private async Task HandleIncomingMessagesAsync()
         {
             while (_pendingMessages.TryDequeue(out TcpPackage package))
             {
@@ -200,6 +211,40 @@ namespace EventStoreClient.Connection
                                     break;
                             }
                         }
+                    }
+                    return;
+                }
+
+                // Catchup Subscription started
+                if (package.Command == TcpCommand.SubscriptionConfirmation)
+                {
+                    if (_catchupSubscriptions.TryGetValue(package.CorrelationId, out var catchupSubscription))
+                    {
+                        // Acknowledge subscription live
+                        catchupSubscription.SubscriptionStarted.SetResult(new object());
+                    }
+                    return;
+                }
+
+                // Catchup Subscription dropped
+                if (package.Command == TcpCommand.SubscriptionDropped)
+                {
+                    if (_catchupSubscriptions.TryGetValue(package.CorrelationId, out var catchupSubscription))
+                    {
+                        // Close subscription
+                        await catchupSubscription.CloseSubscriptionAsync().ConfigureAwait(false);
+                    }
+                    return;
+                }
+
+                // Catchup Subscription event appeared
+                if (package.Command == TcpCommand.StreamEventAppeared)
+                {
+                    if (_catchupSubscriptions.TryGetValue(package.CorrelationId, out var catchupSubscription))
+                    {
+                        // Handle event
+                        var eventAppeared = StreamEventAppeared.Parser.ParseFrom(package.Data.ToArray<byte>());
+                        catchupSubscription.AddEvent(eventAppeared.Event);
                     }
                     return;
                 }
@@ -321,6 +366,59 @@ namespace EventStoreClient.Connection
                 _pendingWrites.TryRemove(writeCorrelationId, out var _);
 
                 return;
+            }
+            throw new Exception("CorrelationId already in use?");
+        }
+
+        public async Task<CatchupSubscription> CreateCatchupSubscription(string stream, long fromNumber, Func<ResolvedEvent, Task> eventAppearedCallback, int timeout)
+        {
+            var catchupCorrelationId = Guid.NewGuid();
+            var catchupSubscription = new CatchupSubscription(eventAppearedCallback, async () =>
+            {
+                // Remove subscription from dictionary and send package to drop subscription
+                _catchupSubscriptions.TryRemove(catchupCorrelationId, out var _);
+                var dropSubscriptionPackage = new TcpPackage(TcpCommand.UnsubscribeFromStream, catchupCorrelationId, null);
+                _pendingSendMessages.Enqueue(dropSubscriptionPackage);
+            }, catchupCorrelationId);
+
+            if (_catchupSubscriptions.TryAdd(catchupCorrelationId, catchupSubscription))
+            {
+#pragma warning disable 4014
+                // Launch a new task to handle the subscription startup
+                Task.Run(async () =>
+#pragma warning restore 4014
+                {
+                    var subscriptionMessage = new SubscribeToStream()
+                    {
+                        EventStreamId = stream,
+                        ResolveLinkTos = true
+                    };
+
+                    // Serialize message
+                    ArraySegment<byte> messageSerialized;
+                    using (var memory = new MemoryStream())
+                    {
+                        subscriptionMessage.WriteTo(memory);
+                        messageSerialized = new ArraySegment<byte>(memory.GetBuffer(), 0, (int)memory.Length);
+                    }
+
+                    var package = new TcpPackage(TcpCommand.SubscribeToStream, catchupCorrelationId, messageSerialized.ToArray<byte>());
+                    _pendingSendMessages.Enqueue(package);
+
+                    // Wait for subscription to start before returning it
+                    if (await Task.WhenAny(catchupSubscription.SubscriptionStarted.Task, Task.Delay(timeout)) !=
+                        catchupSubscription.SubscriptionStarted.Task)
+                    {
+
+                        // Timed out before completing subscription startup with server
+                        await catchupSubscription.CloseSubscriptionAsync().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        throw new Exception("Failed to create stream subscription after completing initial event reads.");
+                    }
+                });
+                return catchupSubscription;
             }
             throw new Exception("CorrelationId already in use?");
         }
