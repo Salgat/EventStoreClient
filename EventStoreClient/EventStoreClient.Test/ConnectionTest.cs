@@ -253,7 +253,7 @@ namespace EventStoreClient.Test
                 await WriteRandomEventToStream(streamId, connection).ConfigureAwait(false);
             }
 
-            const int attempts = 5;
+            const int attempts = 10;
             for (var i = 0; i < attempts; ++i)
             {
                 if (Thread.VolatileRead(ref totalEventsHandled) == initialEventCounter + afterEventCounter)

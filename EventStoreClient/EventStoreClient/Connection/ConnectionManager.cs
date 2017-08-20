@@ -11,6 +11,7 @@ using System.Diagnostics;
 using EventStore.Client.Messages;
 using Google.Protobuf.Collections;
 using System.IO;
+using System.Threading;
 using static EventStore.Client.Messages.ReadStreamEventsCompleted.Types;
 
 namespace EventStoreClient.Connection
@@ -252,17 +253,36 @@ namespace EventStoreClient.Connection
             }
         }
 
-        public async Task<IEnumerable<RecordedEvent>> ReadEvents(string stream, long fromNumber, int count, bool resolveLinkTos, Func<ResolvedEvent, Task> eventHandlerCallback = null)
+        /// <summary>
+        /// Reads events from a provided stream.
+        /// </summary>
+        /// <param name="stream"></param>
+        /// <param name="fromNumber"></param>
+        /// <param name="count"></param>
+        /// <param name="resolveLinkTos"></param>
+        /// <param name="eventHandlerCallback">Executes the callback against the read events.</param>
+        /// <param name="discardEvents">Does not keep the events in memory after reading them. Useful for running callbacks against stream events where the result doesn't matter, especially on larger streams.</param>
+        /// <returns></returns>
+        public async Task<IEnumerable<RecordedEvent>> ReadEvents(string stream, long fromNumber, long count, bool resolveLinkTos, Func<ResolvedEvent, Task> eventHandlerCallback = null, bool discardEvents = false)
         {
             const int batchSize = 512;
             var result = new List<RecordedEvent>();
-            int currentFromNumber = 0;
-            long lastEventNumber = fromNumber + count - 1;
+            long currentFromNumber = fromNumber;
+            long lastEventNumber;
+            try
+            {
+                lastEventNumber = checked(fromNumber + count - 1);
+            }
+            catch (OverflowException)
+            {
+                // We know a stream can only hold long.MaxValue, so we just set to end of stream
+                lastEventNumber = long.MaxValue;
+            }
             while (currentFromNumber <= lastEventNumber)
             {
                 // TODO: Update batch size to be configurable
                 var batchResult = (await ReadEventsBatch(stream, currentFromNumber, batchSize, resolveLinkTos, eventHandlerCallback).ConfigureAwait(false)).ToList();
-                result.AddRange(batchResult);
+                if (!discardEvents) result.AddRange(batchResult);
 
                 // If this read resulted in no events, we are done reading
                 if (!batchResult.Any()) break;
@@ -305,7 +325,6 @@ namespace EventStoreClient.Connection
 
                 // Return result
                 var events = new List<RecordedEvent>();
-                long counter = 0;
                 foreach (var e in result.Events)
                 {
                     // Create result
@@ -327,13 +346,12 @@ namespace EventStoreClient.Connection
                     {
                         Event = e.Event,
                         Link = e.Link,
-                        CommitPosition = fromNumber + counter,
-                        PreparePosition = fromNumber + counter
+                        // TODO: Determine if this is correct
+                        CommitPosition = e.Event.EventNumber,
+                        PreparePosition = e.Event.EventNumber
                     };
 
                     if (eventHandlerCallback != null) await eventHandlerCallback(resolvedEvent).ConfigureAwait(false);
-
-                    ++counter;
                 }
 
                 return events;
@@ -412,8 +430,9 @@ namespace EventStoreClient.Connection
 #pragma warning restore 4014
                 {
                     // First, read all events on stream from position provided (since stream subscription only returns new events)
-                    
+                    await ReadEvents(stream, fromNumber, long.MaxValue, true, catchupSubscription.HandleEvent, true).ConfigureAwait(false);
 
+                    // Then start stream
                     var subscriptionMessage = new SubscribeToStream()
                     {
                         EventStreamId = stream,
@@ -435,14 +454,17 @@ namespace EventStoreClient.Connection
                     if (await Task.WhenAny(catchupSubscription.SubscriptionStarted.Task, Task.Delay(timeout)) !=
                         catchupSubscription.SubscriptionStarted.Task)
                     {
-
                         // Timed out before completing subscription startup with server
                         await catchupSubscription.CloseSubscriptionAsync().ConfigureAwait(false);
-                    }
-                    else
-                    {
                         throw new Exception("Failed to create stream subscription after completing initial event reads.");
                     }
+
+                    // Read remaining events before subscription started
+                    var streamStart = await catchupSubscription.SubscriptionStarted.Task.ConfigureAwait(false);
+                    await ReadEvents(stream, Thread.VolatileRead(ref catchupSubscription.LastEventNumberHandled), streamStart - catchupSubscription.LastEventNumberHandled, true, catchupSubscription.HandleEvent, true).ConfigureAwait(false);
+
+                    // Events handled up to where stream subscription started, so can start handling incoming subscription events now
+                    catchupSubscription.CatchupToStreamCompleted();
                 });
                 return catchupSubscription;
             }
