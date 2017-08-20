@@ -33,14 +33,14 @@ namespace EventStoreClient.Connection
     internal class ConnectionManager
     {
         private readonly ConnectionSettings _settings;
-        private bool connected = false;
-        private Socket connection = null;
-        ConcurrentQueue<TcpPackage> _pendingMessages = new ConcurrentQueue<TcpPackage>();
-        ConcurrentQueue<TcpPackage> _pendingSendMessages = new ConcurrentQueue<TcpPackage>();
+        private bool _connected = false;
+        private Socket _connection = null;
+        readonly ConcurrentQueue<TcpPackage> _pendingMessages = new ConcurrentQueue<TcpPackage>();
+        readonly ConcurrentQueue<TcpPackage> _pendingSendMessages = new ConcurrentQueue<TcpPackage>();
         private readonly ArraySegment<byte> _receiveBuffer = new ArraySegment<byte>(new byte[TcpConfiguration.SocketBufferSize]);
 
-        private ConcurrentDictionary<Guid, TaskCompletionSource<object>> _pendingWrites = new ConcurrentDictionary<Guid, TaskCompletionSource<object>>();
-        private ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>> _pendingReads = new ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>>();
+        private readonly ConcurrentDictionary<Guid, TaskCompletionSource<object>> _pendingWrites = new ConcurrentDictionary<Guid, TaskCompletionSource<object>>();
+        private readonly ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>> _pendingReads = new ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>>();
 
         public ConnectionManager(ConnectionSettings settings)
         {
@@ -52,15 +52,15 @@ namespace EventStoreClient.Connection
             var ip = IPAddress.Parse(_settings.HostAddress);
             var remoteEndpoint = new IPEndPoint(ip, _settings.Port);
 
-            connection = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            await connection.ConnectAsync(remoteEndpoint).ConfigureAwait(false);
-            connected = true;
+            _connection = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            await _connection.ConnectAsync(remoteEndpoint).ConfigureAwait(false);
+            _connected = true;
 
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
             Task.Run(async () =>
             {
                 Listen();
-                while (connected)
+                while (_connected)
                 {
                     await ManageConnection().ConfigureAwait(false);
                     await Task.Delay(10).ConfigureAwait(false);
@@ -69,11 +69,11 @@ namespace EventStoreClient.Connection
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
         }
 
-        public async Task CloseConnectionAsync()
+        public void CloseConnection()
         {
-            connected = false;
-            connection.Shutdown(SocketShutdown.Both);
-            connection.Dispose();
+            _connected = false;
+            _connection.Shutdown(SocketShutdown.Both);
+            _connection.Dispose();
         }
 
         /// <summary>
@@ -82,25 +82,25 @@ namespace EventStoreClient.Connection
         /// <returns></returns>
         private async Task ManageConnection()
         {
-            await HandleIncomingMessages().ConfigureAwait(false);
+            HandleIncomingMessages();
             await HandlePendingSendMessages().ConfigureAwait(false);
         }
 
         private async Task Listen()
         {
             var framer = new LengthPrefixMessageFramer(IncomingMessageArrived);
-            while (connected)
+            while (_connected)
             {
-                int size = 0;
+                var size = 0;
                 try
                 {
-                    size = await connection.ReceiveAsync(_receiveBuffer, SocketFlags.None).ConfigureAwait(false);
+                    size = await _connection.ReceiveAsync(_receiveBuffer, SocketFlags.None).ConfigureAwait(false);
                 }
                 catch (SocketException ex)
                 {
                     if (ex.SocketErrorCode == SocketError.NotConnected)
                     {
-                        connected = false;
+                        _connected = false;
                     }
                     return;
                 }
@@ -129,15 +129,15 @@ namespace EventStoreClient.Connection
         {
             var data = package.AsArraySegment();
             var framed = LengthPrefixMessageFramer.FrameData(data);
-            await connection.SendAsync(framed, SocketFlags.None).ConfigureAwait(false);
+            await _connection.SendAsync(framed, SocketFlags.None).ConfigureAwait(false);
         }
 
-        private async Task HandleIncomingMessages()
+        private void HandleIncomingMessages()
         {
             while (_pendingMessages.TryDequeue(out TcpPackage package))
             {
                 // Ignore messages if connection lost
-                if (connected == false) return;
+                if (_connected == false) return;
 
                 // Response ignored
                 if (package.Command == TcpCommand.HeartbeatResponseCommand) return;
@@ -215,11 +215,11 @@ namespace EventStoreClient.Connection
             while (currentFromNumber < lastEventNumber)
             {
                 // TODO: Update batch size to be configurable
-                var batchResult = await ReadEventsBatch(stream, currentFromNumber, batchSize, resolveLinkTos).ConfigureAwait(false);
+                var batchResult = (await ReadEventsBatch(stream, currentFromNumber, batchSize, resolveLinkTos).ConfigureAwait(false)).ToList();
                 result.AddRange(batchResult);
 
                 // If this read resulted in no events, we are done reading
-                if (batchResult.Count() == 0) break;
+                if (!batchResult.Any()) break;
 
                 // Continue to next batch of events
                 currentFromNumber += batchSize;
@@ -255,22 +255,19 @@ namespace EventStoreClient.Connection
 
                 // Wait for read to complete
                 var result = await pendingReadTask.Task.ConfigureAwait(false);
-                _pendingReads.TryRemove(readCorrelationId, out var discard);
+                _pendingReads.TryRemove(readCorrelationId, out var _);
 
                 // Return result
-                return result.Events.Select(e => 
+                return result.Events.Select(e => new RecordedEvent()
                 {
-                    return new RecordedEvent()
-                    {
-                        Stream = e.Event.EventStreamId,
-                        Id = new Guid(e.Event.EventId.ToByteArray()),
-                        Created = new DateTime(e.Event.Created),
-                        Data = new ArraySegment<byte>(e.Event.Data.ToByteArray()),
-                        MetaData = new ArraySegment<byte>(e.Event.Metadata.ToByteArray()),
-                        EventNumber = e.Event.EventNumber,
-                        EventType = e.Event.EventType,
-                        IsJson = e.Event.DataContentType == 1
-                    };
+                    Stream = e.Event.EventStreamId,
+                    Id = new Guid(e.Event.EventId.ToByteArray()),
+                    Created = new DateTime(e.Event.Created),
+                    Data = new ArraySegment<byte>(e.Event.Data.ToByteArray()),
+                    MetaData = new ArraySegment<byte>(e.Event.Metadata.ToByteArray()),
+                    EventNumber = e.Event.EventNumber,
+                    EventType = e.Event.EventType,
+                    IsJson = e.Event.DataContentType == 1
                 });
             }
             throw new Exception("CorrelationId already in use?");
@@ -321,7 +318,7 @@ namespace EventStoreClient.Connection
 
                 // Wait for write to be acknowledged by server then remove completed task
                 await pendingWriteTask.Task.ConfigureAwait(false);
-                _pendingWrites.TryRemove(writeCorrelationId, out var discard);
+                _pendingWrites.TryRemove(writeCorrelationId, out var _);
 
                 return;
             }

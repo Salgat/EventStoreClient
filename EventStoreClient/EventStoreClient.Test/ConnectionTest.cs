@@ -32,7 +32,7 @@ namespace EventStoreClient.Test
 
             await connection.ConnectAsync().ConfigureAwait(false);
 
-            var streamId = $"TestStream-{Guid.NewGuid()}";
+            var streamId = $"TestStream-{Guid.NewGuid():N}";
             var events = new List<CreateEvent>()
             {
                 new CreateEvent()
@@ -57,7 +57,7 @@ namespace EventStoreClient.Test
 
             await connection.ConnectAsync().ConfigureAwait(false);
 
-            var streamId = $"TestStream-{Guid.NewGuid()}";
+            var streamId = $"TestStream-{Guid.NewGuid():N}";
             var events = new List<CreateEvent>()
             {
                 new CreateEvent()
@@ -82,6 +82,34 @@ namespace EventStoreClient.Test
         }
 
         [TestMethod]
+        public async Task WriteMultipleEvents_SingleLargeWriteOperation_Success()
+        {
+            var credentials = new UserCredentials("admin", "changeit");
+            var connectionSettings = new ConnectionSettings(credentials, "127.0.0.1", 1113, "myConnection");
+            var connection = new EventStoreConnection(connectionSettings);
+
+            await connection.ConnectAsync().ConfigureAwait(false);
+
+            var streamId = $"TestStream-{Guid.NewGuid():N}";
+
+            var events = new List<CreateEvent>();
+            for (var i = 0; i < 100000; ++i)
+            {
+                var eventToWrite = new CreateEvent()
+                {
+                    Id = Guid.NewGuid(),
+                    EventType = "TestType",
+                    IsJson = true,
+                    Data = Encoding.UTF8.GetBytes("{}"),
+                    MetaData = Encoding.UTF8.GetBytes("{}")
+                };
+                events.Add(eventToWrite);
+            }
+            
+            await connection.WriteEvents(events, streamId, -1).ConfigureAwait(false);
+        }
+
+        [TestMethod]
         public async Task WriteMultipleEvents_MultipleWriteOperations_Success()
         {
             var credentials = new UserCredentials("admin", "changeit");
@@ -90,7 +118,7 @@ namespace EventStoreClient.Test
 
             await connection.ConnectAsync().ConfigureAwait(false);
 
-            var streamId = $"TestStream-{Guid.NewGuid()}";
+            var streamId = $"TestStream-{Guid.NewGuid():N}";
             var events = new List<CreateEvent>()
             {
                 new CreateEvent()
@@ -127,7 +155,7 @@ namespace EventStoreClient.Test
 
             await connection.ConnectAsync().ConfigureAwait(false);
 
-            var streamId = $"TestStream-{Guid.NewGuid()}";
+            var streamId = $"TestStream-{Guid.NewGuid():N}";
             var events = new List<CreateEvent>()
             {
                 new CreateEvent()
@@ -164,7 +192,7 @@ namespace EventStoreClient.Test
 
             await connection.ConnectAsync().ConfigureAwait(false);
 
-            var streamId = $"TestStream-{Guid.NewGuid()}";
+            var streamId = $"TestStream-{Guid.NewGuid():N}";
             var events = new List<CreateEvent>()
             {
                 new CreateEvent()
