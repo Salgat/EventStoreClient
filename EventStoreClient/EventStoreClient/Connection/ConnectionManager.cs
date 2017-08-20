@@ -221,7 +221,8 @@ namespace EventStoreClient.Connection
                     if (_catchupSubscriptions.TryGetValue(package.CorrelationId, out var catchupSubscription))
                     {
                         // Acknowledge subscription live
-                        catchupSubscription.SubscriptionStarted.SetResult(new object());
+                        var response = SubscriptionConfirmation.Parser.ParseFrom(package.Data.ToArray<byte>());
+                        catchupSubscription.SubscriptionStarted.SetResult(response.LastEventNumber);
                     }
                     return;
                 }
@@ -251,16 +252,16 @@ namespace EventStoreClient.Connection
             }
         }
 
-        public async Task<IEnumerable<RecordedEvent>> ReadEvents(string stream, long fromNumber, int count, bool resolveLinkTos)
+        public async Task<IEnumerable<RecordedEvent>> ReadEvents(string stream, long fromNumber, int count, bool resolveLinkTos, Func<ResolvedEvent, Task> eventHandlerCallback = null)
         {
             const int batchSize = 512;
             var result = new List<RecordedEvent>();
             int currentFromNumber = 0;
             long lastEventNumber = fromNumber + count - 1;
-            while (currentFromNumber < lastEventNumber)
+            while (currentFromNumber <= lastEventNumber)
             {
                 // TODO: Update batch size to be configurable
-                var batchResult = (await ReadEventsBatch(stream, currentFromNumber, batchSize, resolveLinkTos).ConfigureAwait(false)).ToList();
+                var batchResult = (await ReadEventsBatch(stream, currentFromNumber, batchSize, resolveLinkTos, eventHandlerCallback).ConfigureAwait(false)).ToList();
                 result.AddRange(batchResult);
 
                 // If this read resulted in no events, we are done reading
@@ -273,7 +274,7 @@ namespace EventStoreClient.Connection
             return result;
         }
 
-        private async Task<IEnumerable<RecordedEvent>> ReadEventsBatch(string stream, long fromNumber, int count, bool resolveLinkTos)
+        private async Task<IEnumerable<RecordedEvent>> ReadEventsBatch(string stream, long fromNumber, int count, bool resolveLinkTos, Func<ResolvedEvent, Task> eventHandlerCallback = null)
         {
             var readCorrelationId = Guid.NewGuid();
             var pendingReadTask = new TaskCompletionSource<ReadStreamEventsCompleted>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -303,17 +304,39 @@ namespace EventStoreClient.Connection
                 _pendingReads.TryRemove(readCorrelationId, out var _);
 
                 // Return result
-                return result.Events.Select(e => new RecordedEvent()
+                var events = new List<RecordedEvent>();
+                long counter = 0;
+                foreach (var e in result.Events)
                 {
-                    Stream = e.Event.EventStreamId,
-                    Id = new Guid(e.Event.EventId.ToByteArray()),
-                    Created = new DateTime(e.Event.Created),
-                    Data = new ArraySegment<byte>(e.Event.Data.ToByteArray()),
-                    MetaData = new ArraySegment<byte>(e.Event.Metadata.ToByteArray()),
-                    EventNumber = e.Event.EventNumber,
-                    EventType = e.Event.EventType,
-                    IsJson = e.Event.DataContentType == 1
-                });
+                    // Create result
+                    var recordedEvent = new RecordedEvent()
+                    {
+                        Stream = e.Event.EventStreamId,
+                        Id = new Guid(e.Event.EventId.ToByteArray()),
+                        Created = new DateTime(e.Event.Created),
+                        Data = new ArraySegment<byte>(e.Event.Data.ToByteArray()),
+                        MetaData = new ArraySegment<byte>(e.Event.Metadata.ToByteArray()),
+                        EventNumber = e.Event.EventNumber,
+                        EventType = e.Event.EventType,
+                        IsJson = e.Event.DataContentType == 1
+                    };
+                    events.Add(recordedEvent);
+
+                    // Event Handler
+                    var resolvedEvent = new ResolvedEvent()
+                    {
+                        Event = e.Event,
+                        Link = e.Link,
+                        CommitPosition = fromNumber + counter,
+                        PreparePosition = fromNumber + counter
+                    };
+
+                    if (eventHandlerCallback != null) await eventHandlerCallback(resolvedEvent).ConfigureAwait(false);
+
+                    ++counter;
+                }
+
+                return events;
             }
             throw new Exception("CorrelationId already in use?");
         }
@@ -388,6 +411,9 @@ namespace EventStoreClient.Connection
                 Task.Run(async () =>
 #pragma warning restore 4014
                 {
+                    // First, read all events on stream from position provided (since stream subscription only returns new events)
+                    
+
                     var subscriptionMessage = new SubscribeToStream()
                     {
                         EventStreamId = stream,

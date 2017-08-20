@@ -15,7 +15,7 @@ namespace EventStoreClient
         private readonly ConcurrentQueue<ResolvedEvent> _pendingEvents = new ConcurrentQueue<ResolvedEvent>();
         private int _alive = 0; // 0 = alive, 1 = closed
         private readonly Func<Task> _closeSubscription;
-        internal readonly TaskCompletionSource<object> SubscriptionStarted = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<long> SubscriptionStarted = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         internal CatchupSubscription(Func<ResolvedEvent, Task> eventHandler, Func<Task> closeSubscriptionCallback, Guid correlationId)
         {
