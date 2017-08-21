@@ -21,6 +21,7 @@ namespace EventStoreClient.Connection
         private readonly ConnectionSettings _settings;
         private bool _connected = false;
         private Socket _connection = null;
+        private SemaphoreSlim _connectionLock = new SemaphoreSlim(1);
         readonly ConcurrentQueue<TcpPackage> _pendingMessages = new ConcurrentQueue<TcpPackage>();
         readonly ConcurrentQueue<TcpPackage> _pendingSendMessages = new ConcurrentQueue<TcpPackage>();
         private readonly ArraySegment<byte> _receiveBuffer = new ArraySegment<byte>(new byte[TcpConfiguration.SocketBufferSize]);
@@ -36,12 +37,20 @@ namespace EventStoreClient.Connection
 
         public async Task StartConnection()
         {
-            var ip = IPAddress.Parse(_settings.HostAddress);
-            var remoteEndpoint = new IPEndPoint(ip, _settings.Port);
-
-            _connection = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            await _connection.ConnectAsync(remoteEndpoint).ConfigureAwait(false);
-            _connected = true;
+            await _connectionLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                var ip = IPAddress.Parse(_settings.HostAddress);
+                var remoteEndpoint = new IPEndPoint(ip, _settings.Port);
+                
+                _connection = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                await _connection.ConnectAsync(remoteEndpoint).ConfigureAwait(false);
+                _connected = true;
+            }
+            finally
+            {
+                _connectionLock.Release();
+            }
 
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
             Task.Run(async () =>
@@ -56,11 +65,19 @@ namespace EventStoreClient.Connection
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
         }
 
-        public void CloseConnection()
+        public async Task CloseConnectionAsync()
         {
-            _connected = false;
-            _connection.Shutdown(SocketShutdown.Both);
-            _connection.Dispose();
+            await _connectionLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                _connected = false;
+                _connection.Shutdown(SocketShutdown.Both);
+                _connection.Dispose();
+            }
+            finally
+            {
+                _connectionLock.Release();
+            }
         }
 
         /// <summary>
@@ -126,7 +143,16 @@ namespace EventStoreClient.Connection
         {
             var data = package.AsArraySegment();
             var framed = LengthPrefixMessageFramer.FrameData(data);
-            await _connection.SendAsync(framed, SocketFlags.None).ConfigureAwait(false);
+
+            await _connectionLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await _connection.SendAsync(framed, SocketFlags.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                _connectionLock.Release();
+            }
         }
 
         private async Task HandleIncomingMessagesAsync()

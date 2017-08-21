@@ -26,7 +26,7 @@ namespace EventStoreClient.Connection
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
             // Although not async, we make this Public method async due to the likelihood of future changes requiring it to be async
-            _connectionManager.CloseConnection();
+            await _connectionManager.CloseConnectionAsync().ConfigureAwait(false);
         }
 
         public async Task ConnectAsync()
