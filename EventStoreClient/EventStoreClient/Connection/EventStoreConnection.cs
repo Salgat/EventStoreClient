@@ -51,7 +51,7 @@ namespace EventStoreClient.Connection
         public Task<CatchupSubscription> CreateCatchupSubscription(string stream, long fromNumber, Func<ResolvedEvent, Task> eventAppearedCallback)
         {
             if (started == 0) throw new Exception("Connection not started yet.");
-            return _connectionManager.CreateCatchupSubscription(stream, fromNumber, eventAppearedCallback, Settings.CatchupSubscriptionTimeout);
+            return _connectionManager.CreateCatchupSubscriptionAsync(stream, fromNumber, eventAppearedCallback, Settings.CatchupSubscriptionTimeout);
         }
     }
 }
