@@ -22,46 +22,56 @@ namespace EventStoreClient.Connection
         {
             var writeCorrelationId = Guid.NewGuid();
             var pendingWriteTask = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
-            if (_pendingWrites.TryAdd(writeCorrelationId, pendingWriteTask))
+            
+            await _pendingWritesLock.WaitAsync().ConfigureAwait(false);
+            try
             {
-                // Populate protobuf objects for events
-                var eventsToWrite = events.Select(e => new NewEvent()
+                if (_pendingWrites.TryAdd(writeCorrelationId, pendingWriteTask))
                 {
-                    EventId = ByteString.CopyFrom(e.Id.ToByteArray()),
-                    EventType = e.EventType,
-                    Data = ByteString.CopyFrom(e.Data.Array),
-                    DataContentType = e.IsJson ? 1 : 0,
-                    Metadata = ByteString.CopyFrom(e.MetaData.Array),
-                    MetadataContentType = 0
-                });
+                    // Populate protobuf objects for events
+                    var eventsToWrite = events.Select(e => new NewEvent()
+                    {
+                        EventId = ByteString.CopyFrom(e.Id.ToByteArray()),
+                        EventType = e.EventType,
+                        Data = ByteString.CopyFrom(e.Data.Array),
+                        DataContentType = e.IsJson ? 1 : 0,
+                        Metadata = ByteString.CopyFrom(e.MetaData.Array),
+                        MetadataContentType = 0
+                    });
 
-                var writeEventsMessage = new WriteEvents()
-                {
-                    EventStreamId = stream,
-                    ExpectedVersion = expectedVersion,
-                    RequireMaster = true
-                };
-                writeEventsMessage.Events.AddRange(eventsToWrite);
+                    var writeEventsMessage = new WriteEvents()
+                    {
+                        EventStreamId = stream,
+                        ExpectedVersion = expectedVersion,
+                        RequireMaster = true
+                    };
+                    writeEventsMessage.Events.AddRange(eventsToWrite);
 
-                // Serialize events
-                ArraySegment<byte> eventsSerialized;
-                using (var memory = new MemoryStream())
-                {
-                    writeEventsMessage.WriteTo(memory);
-                    eventsSerialized = new ArraySegment<byte>(memory.GetBuffer(), 0, (int)memory.Length);
+                    // Serialize events
+                    ArraySegment<byte> eventsSerialized;
+                    using (var memory = new MemoryStream())
+                    {
+                        writeEventsMessage.WriteTo(memory);
+                        eventsSerialized = new ArraySegment<byte>(memory.GetBuffer(), 0, (int)memory.Length);
+                    }
+
+                    // Send write package
+                    var package = new TcpPackage(TcpCommand.WriteEvents, writeCorrelationId, eventsSerialized.ToArray<byte>());
+                    _pendingSendMessages.Enqueue(package);
                 }
-
-                // Send write package
-                var package = new TcpPackage(TcpCommand.WriteEvents, writeCorrelationId, eventsSerialized.ToArray<byte>());
-                _pendingSendMessages.Enqueue(package);
-
-                // Wait for write to be acknowledged by server then remove completed task
-                await pendingWriteTask.Task.ConfigureAwait(false);
-                _pendingWrites.TryRemove(writeCorrelationId, out var _);
-
-                return;
+                else
+                {
+                    throw new Exception("CorrelationId already in use?");
+                }
             }
-            throw new Exception("CorrelationId already in use?");
+            finally
+            {
+                _pendingWritesLock.Release();
+            }
+
+            // Wait for write to be acknowledged by server then remove completed task
+            await pendingWriteTask.Task.ConfigureAwait(false);
+            _pendingWrites.TryRemove(writeCorrelationId, out var _);
         }
     }
 }

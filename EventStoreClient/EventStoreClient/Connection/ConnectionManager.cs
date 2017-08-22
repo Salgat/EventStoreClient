@@ -13,6 +13,7 @@ using Google.Protobuf.Collections;
 using System.IO;
 using System.Threading;
 using static EventStore.Client.Messages.ReadStreamEventsCompleted.Types;
+using EventStoreClient.Exceptions;
 
 namespace EventStoreClient.Connection
 {
@@ -26,8 +27,10 @@ namespace EventStoreClient.Connection
         readonly ConcurrentQueue<TcpPackage> _pendingSendMessages = new ConcurrentQueue<TcpPackage>();
         private readonly ArraySegment<byte> _receiveBuffer = new ArraySegment<byte>(new byte[TcpConfiguration.SocketBufferSize]);
 
-        private readonly ConcurrentDictionary<Guid, TaskCompletionSource<object>> _pendingWrites = new ConcurrentDictionary<Guid, TaskCompletionSource<object>>();
-        private readonly ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>> _pendingReads = new ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>>();
+        private SemaphoreSlim _pendingWritesLock = new SemaphoreSlim(1);
+        private ConcurrentDictionary<Guid, TaskCompletionSource<object>> _pendingWrites = new ConcurrentDictionary<Guid, TaskCompletionSource<object>>();
+        private SemaphoreSlim _pendingReadsLock = new SemaphoreSlim(1);
+        private ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>> _pendingReads = new ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>>();
         private readonly ConcurrentDictionary<Guid, CatchupSubscription> _catchupSubscriptions = new ConcurrentDictionary<Guid, CatchupSubscription>();
 
         public ConnectionManager(ConnectionSettings settings)
@@ -40,12 +43,7 @@ namespace EventStoreClient.Connection
             await _connectionLock.WaitAsync().ConfigureAwait(false);
             try
             {
-                var ip = IPAddress.Parse(_settings.HostAddress);
-                var remoteEndpoint = new IPEndPoint(ip, _settings.Port);
-                
-                _connection = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                await _connection.ConnectAsync(remoteEndpoint).ConfigureAwait(false);
-                _connected = true;
+                await ConnectNewSocket().ConfigureAwait(false);
             }
             finally
             {
@@ -63,6 +61,16 @@ namespace EventStoreClient.Connection
                 }
             });
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
+        }
+
+        private async Task ConnectNewSocket()
+        {
+            var ip = IPAddress.Parse(_settings.HostAddress);
+            var remoteEndpoint = new IPEndPoint(ip, _settings.Port);
+
+            _connection = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            await _connection.ConnectAsync(remoteEndpoint).ConfigureAwait(false);
+            _connected = true;
         }
 
         public async Task CloseConnectionAsync()
@@ -115,6 +123,54 @@ namespace EventStoreClient.Connection
                     if (ex.SocketErrorCode == SocketError.NotConnected)
                     {
                         _connected = false;
+                        _connection.Dispose();
+                        const int maxReconnectionAttempts = 10;
+                        for (var i = 0; i < maxReconnectionAttempts; ++i)
+                        {
+                            try
+                            {
+                                await Task.Delay(1000).ConfigureAwait(false); // TODO: Make this configurable (reconnection timeout)
+
+                                // Reattempt connection
+                                await ConnectNewSocket().ConfigureAwait(false);
+
+                                // Set all pending reads to handle a reconnection exception causing them to retry the operation then reset the pendingReads so the old operations are ignored
+                                await _pendingReadsLock.WaitAsync().ConfigureAwait(false);
+                                try
+                                {
+                                    foreach (var entry in _pendingReads)
+                                    {
+                                        entry.Value.TrySetException(new ReconnectionException());
+                                    }
+                                    _pendingReads = new ConcurrentDictionary<Guid, TaskCompletionSource<ReadStreamEventsCompleted>>();
+                                }
+                                finally
+                                {
+                                    _pendingReadsLock.Release();
+                                }
+
+                                // Set all pending writes to handle a reconnection exception causing them to retry the operation then reset the pendingWrites so the old operations are ignored
+                                await _pendingWritesLock.WaitAsync().ConfigureAwait(false);
+                                try
+                                {
+                                    foreach (var entry in _pendingWrites)
+                                    {
+                                        entry.Value.TrySetException(new ReconnectionException());
+                                    }
+                                    _pendingWrites = new ConcurrentDictionary<Guid, TaskCompletionSource<object>>();
+                                }
+                                finally
+                                {
+                                    _pendingWritesLock.Release();
+                                }
+
+                                break;
+                            }
+                            catch (Exception ex2)
+                            {
+                                // TODO: Be more specific with exception
+                            }
+                        }
                     }
                     return;
                 }
@@ -186,16 +242,16 @@ namespace EventStoreClient.Connection
                             {
                                 // TODO: Implement proper exception classes
                                 case OperationResult.Success:
-                                    pendingWrite.SetResult(new object());
+                                    pendingWrite.TrySetResult(new object());
                                     break;
                                 case OperationResult.CommitTimeout:
-                                    pendingWrite.SetException(new Exception("CommitTimeout exception"));
+                                    pendingWrite.TrySetException(new Exception("CommitTimeout exception"));
                                     break;
                                 case OperationResult.WrongExpectedVersion:
-                                    pendingWrite.SetException(new Exception("WrongExpectedVersion exception"));
+                                    pendingWrite.TrySetException(new Exception("WrongExpectedVersion exception"));
                                     break;
                                 default:
-                                    pendingWrite.SetException(new Exception($"Unexpected exception: {response.Message}"));
+                                    pendingWrite.TrySetException(new Exception($"Unexpected exception: {response.Message}"));
                                     break;
                             }
                         }
@@ -216,10 +272,10 @@ namespace EventStoreClient.Connection
                             {
                                 case ReadStreamResult.Success:
                                 case ReadStreamResult.NoStream:
-                                    pendingRead.SetResult(response);
+                                    pendingRead.TrySetResult(response);
                                     break;
                                 default:
-                                    pendingRead.SetException(new Exception($"Unexpected exception"));
+                                    pendingRead.TrySetException(new Exception($"Unexpected exception"));
                                     break;
                             }
                         }
