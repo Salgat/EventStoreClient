@@ -124,8 +124,8 @@ namespace EventStoreClient.Connection
                     {
                         _connected = false;
                         _connection.Dispose();
-                        const int maxReconnectionAttempts = 10;
-                        for (var i = 0; i < maxReconnectionAttempts; ++i)
+                        var maxReconnectionAttempts = _settings.MaxReconnectAttempts;
+                        for (var i = 0; maxReconnectionAttempts == -1 || i < maxReconnectionAttempts; ++i)
                         {
                             try
                             {
